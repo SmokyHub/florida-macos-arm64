@@ -1,0 +1,167 @@
+name: Build Florida (macOS arm64)
+
+# Pulls the latest Frida release, applies the vendored Ylarod/Florida patches,
+# builds for Apple Silicon (macos-arm64) and publishes the binaries as a release
+# tagged with the Frida version.
+
+on:
+  schedule:
+    - cron: "0 10 * * *"   # daily, 10:00 UTC
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/build.yml"
+      - "patches/**"
+
+permissions:
+  contents: write
+
+jobs:
+  check_version:
+    runs-on: ubuntu-22.04
+    outputs:
+      FRIDA_VERSION: ${{ steps.pull.outputs.FRIDA_VERSION }}
+      ALREADY_RELEASE: ${{ steps.check.outputs.ALREADY_RELEASE }}
+    steps:
+      - name: Get latest Frida version
+        id: pull
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver=$(gh release view --repo frida/frida --json tagName --jq .tagName)
+          echo "FRIDA_VERSION=$ver" >> "$GITHUB_OUTPUT"
+          echo "Latest Frida release: $ver"
+
+      - name: Check whether this version is already released here
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver="${{ steps.pull.outputs.FRIDA_VERSION }}"
+          if gh release view "$ver" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # Already released. Rebuild (delete + recreate) only when triggered
+            # manually or by a push; skip on the scheduled run.
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "ALREADY_RELEASE=1" >> "$GITHUB_OUTPUT"
+            else
+              echo "ALREADY_RELEASE=2" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "ALREADY_RELEASE=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Delete existing release for rebuild
+        if: steps.check.outputs.ALREADY_RELEASE == '2'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ steps.pull.outputs.FRIDA_VERSION }}" \
+            --repo "${{ github.repository }}" --cleanup-tag --yes || true
+
+  build:
+    needs: check_version
+    if: needs.check_version.outputs.ALREADY_RELEASE != '1'
+    runs-on: macos-14   # Apple Silicon (arm64) runner
+    timeout-minutes: 120
+    env:
+      FRIDA_VERSION: ${{ needs.check_version.outputs.FRIDA_VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install build dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          # lief is imported by Florida's anti-anti-frida.py (only exercised on
+          # linux/android builds upstream, installed here for completeness).
+          python3 -m pip install lief
+
+      - name: Clone Frida ${{ env.FRIDA_VERSION }} and apply Florida patches
+        run: |
+          set -euo pipefail
+          git config --global user.name  "GitHub Actions"
+          git config --global user.email "actions@users.noreply.github.com"
+
+          git clone https://github.com/frida/frida
+          cd frida
+          git checkout "refs/tags/${FRIDA_VERSION}"
+          git submodule update --init --recursive
+          cd ..
+
+          for path in patches/*; do
+            name=$(basename "$path")
+            count=$(ls "patches/$name"/*.patch | wc -l | tr -d ' ')
+            echo "Applying $count patch(es) to frida/subprojects/$name"
+            (
+              cd "frida/subprojects/$name"
+              git am --3way "$GITHUB_WORKSPACE/patches/$name"/*.patch
+            )
+          done
+
+      - name: Build (macos-arm64)
+        run: |
+          set -euo pipefail
+          mkdir build-macos-arm64
+          cd build-macos-arm64
+          ../frida/configure --host=macos-arm64
+          make
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          b=build-macos-arm64
+          out="$GITHUB_WORKSPACE/dist"; mkdir -p "$out"
+          v="$FRIDA_VERSION"
+
+          # Prefer the known path; fall back to a search so a layout change
+          # in a future Frida version does not silently break packaging.
+          pick() {
+            local name="$1" hint="$2"
+            if [ -f "$b/$hint" ]; then echo "$b/$hint"; return; fi
+            find "$b" -type f -name "$name" | head -n1
+          }
+
+          server=$(pick frida-server          subprojects/frida-core/server/frida-server)
+          inject=$(pick frida-inject          subprojects/frida-core/inject/frida-inject)
+          gadget=$(pick frida-gadget.dylib    subprojects/frida-core/lib/gadget/frida-gadget.dylib)
+          gumjs=$(pick  libfrida-gumjs-1.0.a  subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a)
+
+          fail=0
+          for pair in "server=$server" "inject=$inject" "gadget=$gadget" "gumjs=$gumjs"; do
+            key=${pair%%=*}; val=${pair#*=}
+            if [ -z "$val" ] || [ ! -f "$val" ]; then
+              echo "::error::Missing build artifact: $key"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          cp "$server" "$out/florida-server-$v-macos-arm64"
+          cp "$inject" "$out/florida-inject-$v-macos-arm64"
+          cp "$gadget" "$out/florida-gadget-$v-macos-arm64.dylib"
+          cp "$gumjs"  "$out/florida-gumjs-$v-macos-arm64.a"
+          gzip -f "$out"/*
+          (cd "$out" && shasum -a 256 * > "SHA256SUMS")
+          ls -la "$out"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.FRIDA_VERSION }}
+          name: ${{ env.FRIDA_VERSION }}
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Frida **${{ env.FRIDA_VERSION }}** patched with the [Ylarod/Florida](https://github.com/Ylarod/Florida) anti-detection patches, built for **macOS arm64 (Apple Silicon)**.
+
+            Assets are gzip-compressed. Verify with `SHA256SUMS`. `gunzip` before use, then `chmod +x`.
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
