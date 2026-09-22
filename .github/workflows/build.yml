@@ -84,26 +84,28 @@ jobs:
           # linux/android builds upstream, installed here for completeness).
           python3 -m pip install lief
 
-      - name: Clone Frida ${{ env.FRIDA_VERSION }} and apply Florida patches
+      - name: Clone Frida and apply Florida patches
         run: |
           set -euo pipefail
-          git config --global user.name  "GitHub Actions"
-          git config --global user.email "actions@users.noreply.github.com"
 
-          git clone https://github.com/frida/frida
-          cd frida
-          git checkout "refs/tags/${FRIDA_VERSION}"
-          git submodule update --init --recursive
-          cd ..
+          # Build against Frida's default branch (as upstream Florida does): the
+          # Florida patches track frida main, and the frida super-repo pins each
+          # subproject to a matching commit. The release is still tagged with the
+          # latest Frida release version below.
+          git clone --recurse-submodules https://github.com/frida/frida
 
+          # Apply with GNU patch and a small fuzz factor rather than `git am`:
+          # frida periodically adds doc-comments etc. that shift the patch
+          # context, and strict `git am` rejects that even though the changed
+          # lines are unchanged. Fuzz absorbs pure context drift; a real
+          # conflict still fails the step (and so produces no broken release).
           for path in patches/*; do
             name=$(basename "$path")
-            count=$(ls "patches/$name"/*.patch | wc -l | tr -d ' ')
-            echo "Applying $count patch(es) to frida/subprojects/$name"
-            (
-              cd "frida/subprojects/$name"
-              git am --3way "$GITHUB_WORKSPACE/patches/$name"/*.patch
-            )
+            echo "== Applying patches to frida/subprojects/$name =="
+            for p in "$GITHUB_WORKSPACE/patches/$name"/*.patch; do
+              echo "  -> $(basename "$p")"
+              patch -p1 --forward --fuzz=3 -d "frida/subprojects/$name" < "$p"
+            done
           done
 
       - name: Build (macos-arm64)
