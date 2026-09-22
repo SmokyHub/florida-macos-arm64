@@ -118,7 +118,10 @@ jobs:
           set -euo pipefail
           mkdir build-macos-arm64
           cd build-macos-arm64
-          ../frida/configure --host=macos-arm64
+          # The umbrella frida project only auto-enables server/gadget/inject for
+          # cross-builds; a native macOS build leaves them off. Force them on.
+          ../frida/configure --host=macos-arm64 \
+            --enable-server --enable-gadget --enable-inject
           make
 
       - name: Package artifacts
@@ -127,6 +130,10 @@ jobs:
           b=build-macos-arm64
           out="$GITHUB_WORKSPACE/dist"; mkdir -p "$out"
           v="$FRIDA_VERSION"
+
+          echo "== Built binaries under $b =="
+          find "$b" -type f \( -name 'frida-server*' -o -name 'frida-inject*' \
+            -o -name 'frida-gadget*' -o -name 'libfrida-gumjs-1.0.a' \) | sort
 
           # Prefer the known path; fall back to a search so a layout change
           # in a future Frida version does not silently break packaging.
