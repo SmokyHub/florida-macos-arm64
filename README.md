@@ -53,6 +53,46 @@ sudo ./florida-server-<ver>-macos-arm64
 frida -H 127.0.0.1 -f /path/to/App.app/Contents/MacOS/App -l script.js
 ```
 
+## Matching the client version to the server
+
+Frida requires the **host client and the target server to be the same version**
+— it refuses to connect on a mismatch (e.g. *"unable to communicate with the
+remote frida-server; please ensure that major versions match"*). The releases
+here always track the **latest Frida release**, so set your client to the tag
+you downloaded. Vanilla and Florida builds of the same version are compatible,
+so the client stays stock — only the version has to match.
+
+1. **Find the server version.** It's the release tag, and it's in every asset
+   name: `florida-server-17.18.0-android-arm64` → **17.18.0**.
+
+2. **Check your current client:**
+
+   ```sh
+   frida --version
+   ```
+
+3. **Set the client to that exact version** (pip upgrades *or* downgrades):
+
+   ```sh
+   pip install -U "frida==17.18.0" frida-tools
+   frida --version          # should now print 17.18.0
+   ```
+
+   - **pipx:** `pipx runpip frida-tools install "frida==17.18.0"`
+   - **venv / conda:** activate the environment first so the change lands there.
+   - **"externally-managed-environment" error** (Homebrew/system Python): use a
+     venv, or `pipx`, or append `--break-system-packages`.
+
+4. **Confirm the handshake:**
+
+   ```sh
+   frida-ps -U              # Android emulator/device over adb
+   frida-ps -H 127.0.0.1    # local macOS server
+   ```
+
+When a newer Frida comes out, this repo publishes a new release; bump the client
+to that new tag the same way (step 3) to keep them matched.
+
 ## What the Florida patches change
 
 The patches rename Frida's telltale strings, symbols and thread names
