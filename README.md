@@ -58,6 +58,14 @@ Patches are vendored under [`patches/`](patches/) from Ylarod/Florida. To move t
 a newer patch set, copy the updated files from upstream over `patches/` and push;
 the workflow re-runs on changes to `patches/**`.
 
+## Code signing
+
+The binaries are **ad-hoc signed** (`codesign -s -`) — Frida's macOS build
+requires a signing identity, and CI has no Apple certificate. Ad-hoc-signed
+`frida-server` is expected to be run as **root** (`sudo`). If you need a
+Developer ID / entitlement-signed build, re-sign the downloaded binaries
+locally, or fork and set the `MACOS_CERTID` env in the workflow to your identity.
+
 ## Intended use
 
 For authorized security research, mobile/app pentesting and CTF use on systems

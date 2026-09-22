@@ -66,6 +66,11 @@ jobs:
     timeout-minutes: 120
     env:
       FRIDA_VERSION: ${{ needs.check_version.outputs.FRIDA_VERSION }}
+      # Frida's macOS build codesigns frida-helper / frida-agent (and the arm64e
+      # compat variants) and refuses to build without a signing identity.
+      # "-" selects ad-hoc signing (codesign -s -), which needs no Apple
+      # certificate. Ad-hoc-signed frida-server is expected to run as root.
+      MACOS_CERTID: "-"
     steps:
       - uses: actions/checkout@v4
 
