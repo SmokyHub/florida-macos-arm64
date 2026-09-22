@@ -1,8 +1,8 @@
-name: Build Florida (macOS arm64)
+name: Build Florida (macOS arm64 + Android arm64)
 
 # Pulls the latest Frida release, applies the vendored Ylarod/Florida patches,
-# builds for Apple Silicon (macos-arm64) and publishes the binaries as a release
-# tagged with the Frida version.
+# builds for Apple Silicon (macos-arm64) and Android (android-arm64), and
+# publishes the binaries as a single release tagged with the Frida version.
 
 on:
   schedule:
@@ -59,8 +59,25 @@ jobs:
           gh release delete "${{ steps.pull.outputs.FRIDA_VERSION }}" \
             --repo "${{ github.repository }}" --cleanup-tag --yes || true
 
-  build:
+  create_release:
     needs: check_version
+    if: needs.check_version.outputs.ALREADY_RELEASE != '1'
+    runs-on: ubuntu-22.04
+    env:
+      FRIDA_VERSION: ${{ needs.check_version.outputs.FRIDA_VERSION }}
+    steps:
+      - name: Create the release (empty; build jobs upload assets)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          notes="Frida $FRIDA_VERSION patched with the Ylarod/Florida anti-detection patches. Targets: macOS arm64 (Apple Silicon) and Android arm64 (arm64-v8a). Assets are gzip-compressed; gunzip before use, then chmod +x. Verify with the per-target SHA256SUMS-* files."
+          if ! gh release view "$FRIDA_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$FRIDA_VERSION" --repo "$GITHUB_REPOSITORY" \
+              --title "$FRIDA_VERSION" --notes "$notes"
+          fi
+
+  macos_build:
+    needs: [check_version, create_release]
     if: needs.check_version.outputs.ALREADY_RELEASE != '1'
     runs-on: macos-14   # Apple Silicon (arm64) runner
     timeout-minutes: 120
@@ -85,25 +102,18 @@ jobs:
       - name: Install build dependencies
         run: |
           python3 -m pip install --upgrade pip
-          # lief is imported by Florida's anti-anti-frida.py (only exercised on
-          # linux/android builds upstream, installed here for completeness).
           python3 -m pip install lief
 
       - name: Clone Frida and apply Florida patches
         run: |
           set -euo pipefail
-
           # Build against Frida's default branch (as upstream Florida does): the
           # Florida patches track frida main, and the frida super-repo pins each
-          # subproject to a matching commit. The release is still tagged with the
-          # latest Frida release version below.
+          # subproject to a matching commit.
           git clone --recurse-submodules https://github.com/frida/frida
-
-          # Apply with GNU patch and a small fuzz factor rather than `git am`:
-          # frida periodically adds doc-comments etc. that shift the patch
-          # context, and strict `git am` rejects that even though the changed
-          # lines are unchanged. Fuzz absorbs pure context drift; a real
-          # conflict still fails the step (and so produces no broken release).
+          # GNU patch with a small fuzz rather than `git am`: frida periodically
+          # adds doc-comments that shift patch context; fuzz absorbs pure context
+          # drift while a real conflict still fails the step.
           for path in patches/*; do
             name=$(basename "$path")
             echo "== Applying patches to frida/subprojects/$name =="
@@ -135,8 +145,6 @@ jobs:
           find "$b" -type f \( -name 'frida-server*' -o -name 'frida-inject*' \
             -o -name 'frida-gadget*' -o -name 'libfrida-gumjs-1.0.a' \) | sort
 
-          # Prefer the known path; fall back to a search so a layout change
-          # in a future Frida version does not silently break packaging.
           pick() {
             local name="$1" hint="$2"
             if [ -f "$b/$hint" ]; then echo "$b/$hint"; return; fi
@@ -162,20 +170,122 @@ jobs:
           cp "$gadget" "$out/florida-gadget-$v-macos-arm64.dylib"
           cp "$gumjs"  "$out/florida-gumjs-$v-macos-arm64.a"
           gzip -f "$out"/*
-          (cd "$out" && shasum -a 256 * > "SHA256SUMS")
+          (cd "$out" && shasum -a 256 * > "SHA256SUMS-macos-arm64")
           ls -la "$out"
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.FRIDA_VERSION }}
-          name: ${{ env.FRIDA_VERSION }}
-          prerelease: false
-          fail_on_unmatched_files: true
-          body: |
-            Frida **${{ env.FRIDA_VERSION }}** patched with the [Ylarod/Florida](https://github.com/Ylarod/Florida) anti-detection patches, built for **macOS arm64 (Apple Silicon)**.
-
-            Assets are gzip-compressed. Verify with `SHA256SUMS`. `gunzip` before use, then `chmod +x`.
-          files: dist/*
+      - name: Upload assets to release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$FRIDA_VERSION" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  android_build:
+    needs: [check_version, create_release]
+    if: needs.check_version.outputs.ALREADY_RELEASE != '1'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      FRIDA_VERSION: ${{ needs.check_version.outputs.FRIDA_VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          local-cache: false
+          link-to-sdk: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential ninja-build flex bison ruby ruby-dev
+          sudo gem install fpm --no-document
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lief requests
+
+      - name: Clone Frida and apply Florida patches
+        run: |
+          set -euo pipefail
+          git clone --recurse-submodules https://github.com/frida/frida
+          for path in patches/*; do
+            name=$(basename "$path")
+            echo "== Applying patches to frida/subprojects/$name =="
+            for p in "$GITHUB_WORKSPACE/patches/$name"/*.patch; do
+              echo "  -> $(basename "$p")"
+              patch -p1 --forward --fuzz=3 -d "frida/subprojects/$name" < "$p"
+            done
+          done
+
+      - name: Build (android-arm64)
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+          mkdir build-android-arm64
+          cd build-android-arm64
+          # Android is a cross-build, so the umbrella auto-enables these; pass
+          # them explicitly for robustness / parity with the macOS job.
+          ../frida/configure --host=android-arm64 \
+            --enable-server --enable-gadget --enable-inject
+          make
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          b=build-android-arm64
+          out="$GITHUB_WORKSPACE/dist"; mkdir -p "$out"
+          v="$FRIDA_VERSION"
+
+          echo "== Built binaries under $b =="
+          find "$b" -type f \( -name 'frida-server*' -o -name 'frida-inject*' \
+            -o -name 'frida-gadget*' -o -name 'libfrida-gumjs-1.0.a' \) | sort
+
+          pick() {
+            local name="$1" hint="$2"
+            if [ -f "$b/$hint" ]; then echo "$b/$hint"; return; fi
+            find "$b" -type f -name "$name" | head -n1
+          }
+
+          server=$(pick frida-server          subprojects/frida-core/server/frida-server)
+          inject=$(pick frida-inject          subprojects/frida-core/inject/frida-inject)
+          gadget=$(pick frida-gadget.so       subprojects/frida-core/lib/gadget/frida-gadget.so)
+          gumjs=$(pick  libfrida-gumjs-1.0.a  subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a)
+
+          fail=0
+          for pair in "server=$server" "inject=$inject" "gadget=$gadget" "gumjs=$gumjs"; do
+            key=${pair%%=*}; val=${pair#*=}
+            if [ -z "$val" ] || [ ! -f "$val" ]; then
+              echo "::error::Missing build artifact: $key"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          cp "$server" "$out/florida-server-$v-android-arm64"
+          cp "$inject" "$out/florida-inject-$v-android-arm64"
+          cp "$gadget" "$out/florida-gadget-$v-android-arm64.so"
+          cp "$gumjs"  "$out/florida-gumjs-$v-android-arm64.a"
+          gzip -f "$out"/*
+          (cd "$out" && sha256sum * > "SHA256SUMS-android-arm64")
+          ls -la "$out"
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$FRIDA_VERSION" dist/* --repo "$GITHUB_REPOSITORY" --clobber
